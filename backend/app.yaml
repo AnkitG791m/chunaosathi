@@ -1,0 +1,15 @@
+runtime: nodejs20
+env: standard
+service: chunao-saathi-backend
+instance_class: F1
+
+env_variables:
+  NODE_ENV: production
+  FIREBASE_PROJECT_ID: "your-project-id"
+  GOOGLE_CLOUD_PROJECT: "your-project-id"
+  GCS_BUCKET: "chunao-saathi-storage"
+
+automatic_scaling:
+  min_instances: 0
+  max_instances: 3
+  target_cpu_utilization: 0.65

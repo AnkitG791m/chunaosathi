@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+.env.*.local
+.env.*
+serviceAccountKey.json
+*.key.json
+cloude_files_extracted/
+cloude files.zip
+*.zip
+.firebase/
+.DS_Store
+firebase-debug.log
