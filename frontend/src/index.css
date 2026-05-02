@@ -32,3 +32,28 @@ body {
 #root {
   width: 100%;
 }
+
+/* Visible focus ring for keyboard navigation */
+*:focus-visible {
+  outline: 3px solid #FF6B35;
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+/* Remove outline for mouse users only */
+*:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* High contrast mode support */
+@media (prefers-contrast: high) {
+  .tab-btn.on { border: 2px solid #ffffff; }
+  .card { border-color: #ffffff; }
+}
+
+/* Reduced motion support */
+@media (prefers-reduced-motion: reduce) {
+  .fade { animation: none; }
+  .pulse { animation: none; }
+  * { transition-duration: 0.01ms !important; }
+}

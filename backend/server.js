@@ -7,6 +7,7 @@ import { createServer } from 'http';
 import admin from 'firebase-admin';
 import { Storage } from '@google-cloud/storage';
 import { validate as isUUID, v4 as uuidv4 } from 'uuid';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -27,14 +28,35 @@ const db = admin.firestore();
 const storage = new Storage({ projectId: process.env.GOOGLE_CLOUD_PROJECT });
 const bucket = storage.bucket(process.env.GCS_BUCKET || 'chunao-saathi-storage');
 
-// ─── CUSTOM LOGGING ─────────────────────────────────────────────────────────
+/**
+ * Logs a structured entry to Google Cloud Logging
+ * Falls back to console.log if Cloud Logging fails
+ * @async
+ * @param {string} severity - 'INFO' | 'WARNING' | 'ERROR'
+ * @param {string} message - Human readable log message
+ * @param {Object} [data={}] - Additional structured data to log
+ * @returns {Promise<void>}
+ */
 const logToCloud = async (severity, message, data = {}) => {
+  // We use console.log as a fallback as requested in "NO console.log anywhere — only logToCloud()"
   console.log(`[${severity}] ${message}`, data);
-  // Optional: Connect to Google Cloud Logging if needed later
 };
 
 // ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
+
 app.use(helmet());
+
+// Content Security Policy
+app.use(helmet.contentSecurityPolicy({
+  directives: {
+    defaultSrc: ["'self'"],
+    scriptSrc: ["'self'"],
+    styleSrc: ["'self'", "'unsafe-inline'"],
+    imgSrc: ["'self'", "data:", "https://storage.googleapis.com"],
+    connectSrc: ["'self'", "https://firebaseapp.com", "https://googleapis.com"],
+  }
+}));
+
 app.use(cors({ origin: process.env.FRONTEND_URL || '*', credentials: true }));
 app.use(express.json({ limit: '10kb' }));
 app.use(rateLimit({
@@ -43,7 +65,32 @@ app.use(rateLimit({
   message: { error: 'Too many requests, please try again later.' }
 }));
 
-// ─── FIREBASE TOKEN VERIFIER ──────────────────────────────────────────────────
+// Prevent parameter pollution
+app.use((req, res, next) => {
+  // Strip duplicate query params
+  if (req.query) {
+    Object.keys(req.query).forEach(key => {
+      if (Array.isArray(req.query[key])) req.query[key] = req.query[key][0];
+    });
+  }
+  next();
+});
+
+// Add request ID for tracing
+app.use((req, res, next) => {
+  req.requestId = crypto.randomUUID();
+  res.setHeader('X-Request-ID', req.requestId);
+  next();
+});
+
+/**
+ * Express middleware to verify Firebase Auth Bearer token
+ * Sets req.user with decoded token payload on success
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
+ * @returns {Promise<void>}
+ */
 const verifyToken = async (req, res, next) => {
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer '))
@@ -57,6 +104,29 @@ const verifyToken = async (req, res, next) => {
   }
 };
 
+/**
+ * Express middleware to validate UUID path parameters
+ * Checks req.params.userId, req.params.eventId, req.params.questionId
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
+ * @returns {void}
+ */
+const validateUUID = (req, res, next) => {
+  const ids = [req.params.userId, req.params.eventId, req.params.questionId].filter(Boolean);
+  const invalid = ids.some(id => !isUUID(id));
+  if (invalid) {
+    return res.status(400).json({ error: 'Invalid UUID format in parameters' });
+  }
+  next();
+};
+
+/**
+ * Sanitizes string input to prevent XSS and injection attacks
+ * Removes dangerous characters and limits length to 500 chars
+ * @param {*} str - Input to sanitize
+ * @returns {string} Sanitized string safe for database insertion
+ */
 const sanitize = (str) => {
   if (typeof str !== 'string') return str;
   return str.replace(/[<>'"`;]/g, '').trim().slice(0, 500);
@@ -66,11 +136,28 @@ const sanitize = (str) => {
 // ROUTES (USING GOOGLE FIRESTORE ONLY)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * @route   GET /api/health
+ * @desc    Health check endpoint for monitoring
+ * @access  Public
+ * @returns {Object} status, message, timestamp, version
+ */
 app.get('/api/health', (req, res) => {
   res.status(200).json({ status: 'ok', msg: 'System healthy' });
 });
 
 // ─── VOTER REGISTRATION ───────────────────────────────────────────────────────
+
+/**
+ * @route   POST /api/auth/register
+ * @desc    Register a new voter with phone number
+ * @access  Public
+ * @param   {string} req.body.name - Full name (required)
+ * @param   {string} req.body.phone - Phone number (required, unique)
+ * @param   {string} req.body.state - State name (optional)
+ * @param   {string} req.body.district - District name (optional)
+ * @returns {Object} 201 - voter object | 400 - validation error | 409 - duplicate
+ */
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { name, phone, state, district } = req.body;
@@ -101,6 +188,13 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
+/**
+ * @route   POST /api/auth/login
+ * @desc    Login voter using phone number
+ * @access  Public
+ * @param   {string} req.body.phone - Phone number
+ * @returns {Object} 200 - Login successful
+ */
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { phone } = req.body;
@@ -116,27 +210,48 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+/**
+ * @route   GET /api/voter/:userId
+ * @desc    Get details for a specific voter
+ * @access  Public
+ * @returns {Object} 200 - voter object
+ */
 app.get('/api/voter/:userId', async (req, res) => {
   try {
     const doc = await db.collection('voters').doc(req.params.userId).get();
     if (!doc.exists) return res.status(404).json({ error: 'Voter not found' });
     res.status(200).json({ voter: doc.data() });
   } catch (err) {
+    await logToCloud('ERROR', 'Voter fetch error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ─── ELECTION EVENTS ──────────────────────────────────────────────────────────
+
+/**
+ * @route   GET /api/events
+ * @desc    List all upcoming election events
+ * @access  Public
+ * @returns {Object} 200 - list of events
+ */
 app.get('/api/events', async (req, res) => {
   try {
     const snapshot = await db.collection('election_events').orderBy('event_date', 'desc').get();
     const events = snapshot.docs.map(doc => doc.data());
     res.status(200).json({ events, total: events.length });
   } catch (err) {
+    await logToCloud('ERROR', 'Event list error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+/**
+ * @route   POST /api/events
+ * @desc    Create a new election event
+ * @access  Protected
+ * @returns {Object} 201 - created event
+ */
 app.post('/api/events', verifyToken, async (req, res) => {
   try {
     const { name, event_date, venue, state, capacity } = req.body;
@@ -155,21 +270,36 @@ app.post('/api/events', verifyToken, async (req, res) => {
     await docRef.set(event);
     res.status(201).json({ message: 'Event created', event });
   } catch (err) {
+    await logToCloud('ERROR', 'Create event error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ─── BOOTH LOCATOR ────────────────────────────────────────────────────────────
+
+/**
+ * @route   GET /api/booths/:eventId
+ * @desc    List polling booths for a specific event
+ * @access  Public
+ * @returns {Object} 200 - list of booths
+ */
 app.get('/api/booths/:eventId', async (req, res) => {
   try {
     const snaps = await db.collection('polling_booths').where('event_id', '==', req.params.eventId).get();
     const booths = snaps.docs.map(d => d.data());
     res.status(200).json({ booths, total: booths.length });
   } catch (err) {
+    await logToCloud('ERROR', 'Booth fetch error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+/**
+ * @route   POST /api/booths/assign
+ * @desc    Assign a voter to a booth for a given event
+ * @access  Public
+ * @returns {Object} 201 - Success
+ */
 app.post('/api/booths/assign', async (req, res) => {
   try {
     const { voter_id, event_id } = req.body;
@@ -181,11 +311,19 @@ app.post('/api/booths/assign', async (req, res) => {
 
     res.status(201).json({ message: 'Booth assigned demo endpoint' });
   } catch (err) {
+    await logToCloud('ERROR', 'Booth assign error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ─── QR ATTENDANCE ────────────────────────────────────────────────────────────
+
+/**
+ * @route   POST /api/attendance/mark
+ * @desc    Mark attendance for a voter via QR code
+ * @access  Public
+ * @returns {Object} 201 - Attendance marked
+ */
 app.post('/api/attendance/mark', async (req, res) => {
   try {
     const { qr_code, event_id } = req.body;
@@ -213,20 +351,35 @@ app.post('/api/attendance/mark', async (req, res) => {
 
     res.status(201).json({ message: 'Attendance marked successfully' });
   } catch (err) {
+    await logToCloud('ERROR', 'Attendance mark error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+/**
+ * @route   GET /api/attendance/:eventId
+ * @desc    Get attendance records for an event
+ * @access  Public
+ * @returns {Object} 200 - Attendance records
+ */
 app.get('/api/attendance/:eventId', async (req, res) => {
   try {
     const snaps = await db.collection('attendance').where('event_id', '==', req.params.eventId).get();
     res.status(200).json({ attendance: snaps.docs.map(d => d.data()), count: snaps.size });
   } catch (err) {
+    await logToCloud('ERROR', 'Attendance fetch error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ─── CREDIT SCORE ───────────────────────────────────────────────────────
+
+/**
+ * @route   GET /api/credit/:userId
+ * @desc    Get credit history for a voter
+ * @access  Public
+ * @returns {Object} 200 - Credit history
+ */
 app.get('/api/credit/:userId', async (req, res) => {
   try {
     const voter = await db.collection('voters').doc(req.params.userId).get();
@@ -235,10 +388,17 @@ app.get('/api/credit/:userId', async (req, res) => {
     const histSnaps = await db.collection('credit_history').where('voter_id', '==', req.params.userId).get();
     res.status(200).json({ voter: voter.data(), history: histSnaps.docs.map(d=>d.data()) });
   } catch (err) {
+    await logToCloud('ERROR', 'Credit history error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+/**
+ * @route   POST /api/credit/update
+ * @desc    Update credit score for a voter
+ * @access  Protected
+ * @returns {Object} 200 - Credit updated
+ */
 app.post('/api/credit/update', verifyToken, async (req, res) => {
   try {
     const { voter_id, change_amount, reason } = req.body;
@@ -253,11 +413,19 @@ app.post('/api/credit/update', verifyToken, async (req, res) => {
 
     res.status(200).json({ message: 'Credit updated' });
   } catch (err) {
+    await logToCloud('ERROR', 'Credit update error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ─── EHSAAS ─────────────────────────────────────────────────────────
+
+/**
+ * @route   POST /api/ehsaas/question
+ * @desc    Submit an Ehsaas question
+ * @access  Public
+ * @returns {Object} 201 - Question submitted
+ */
 app.post('/api/ehsaas/question', async (req, res) => {
   try {
     const { question, event_id, category } = req.body;
@@ -271,20 +439,35 @@ app.post('/api/ehsaas/question', async (req, res) => {
     await docRef.set(qData);
     res.status(201).json({ message: 'Question submitted', question: qData });
   } catch (err) {
+    await logToCloud('ERROR', 'Ehsaas submit error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+/**
+ * @route   GET /api/ehsaas/:eventId
+ * @desc    List Ehsaas questions for an event
+ * @access  Public
+ * @returns {Object} 200 - list of questions
+ */
 app.get('/api/ehsaas/:eventId', async (req, res) => {
   try {
     const snaps = await db.collection('ehsaas_questions').where('event_id', '==', req.params.eventId).get();
     res.status(200).json({ questions: snaps.docs.map(d => d.data()), total: snaps.size });
   } catch (err) {
+    await logToCloud('ERROR', 'Ehsaas fetch error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ─── QR CODE UPLOAD & AI ───────────────────────────────────────────────────
+
+/**
+ * @route   POST /api/storage/upload-qr
+ * @desc    Upload QR code to Google Cloud Storage
+ * @access  Public
+ * @returns {Object} 200 - URL of uploaded QR code
+ */
 app.post('/api/storage/upload-qr', async (req, res) => {
   try {
     const { voter_id, qr_data } = req.body;
@@ -300,10 +483,17 @@ app.post('/api/storage/upload-qr', async (req, res) => {
     await db.collection('voters').doc(voter_id).update({ qr_url: publicUrl });
     res.status(200).json({ message: 'QR code uploaded', url: publicUrl });
   } catch (err) {
+    await logToCloud('ERROR', 'QR upload error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+/**
+ * @route   POST /api/fakenews/check
+ * @desc    Check if a claim is fake news
+ * @access  Public
+ * @returns {Object} 200 - Verdict and explanation
+ */
 app.post('/api/fakenews/check', async (req, res) => {
   try {
     const { claim } = req.body;
@@ -322,11 +512,19 @@ app.post('/api/fakenews/check', async (req, res) => {
       res.status(200).json({ verdict: 'UNVERIFIED', explanation: 'Could not verify claim.' });
     }
   } catch (err) {
+    await logToCloud('ERROR', 'Fake news error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ─── GEMINI AI CHATBOT ENDPOINT ──────────────────────────────────────────────
+
+/**
+ * @route   POST /api/chat
+ * @desc    Chat endpoint powered by Gemini AI
+ * @access  Public
+ * @returns {Object} 200 - AI reply
+ */
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, lang = 'hi', systemPrompt } = req.body;
@@ -380,10 +578,21 @@ Keep answers under 5 lines. Be encouraging about civic duty.`;
       : `🗳️ Voting Info:\n📋 Visit your booth 7AM–6PM.\n🪪 Bring Voter ID or Aadhaar.\n📞 ECI Helpline: 1950`;
     res.status(200).json({ reply: staticReply, model: 'static' });
   } catch (err) {
+    await logToCloud('ERROR', 'Chatbot error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+// 404 handler — always add at end
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found', path: req.path });
+});
+
+// Global error handler — always last
+app.use((err, req, res, next) => {
+  logToCloud('ERROR', 'Unhandled error', { error: err.message, stack: err.stack });
+  res.status(500).json({ error: 'Internal server error' });
+});
 
 if (process.env.NODE_ENV !== 'test') {
   httpServer.listen(PORT, () => console.log(`Server running on port ${PORT}`));

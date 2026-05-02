@@ -1,6 +1,7 @@
 // frontend/src/App.jsx
 // Chunao Saathi — FINAL PREMIUM UI v3 | AI-Test Optimized
-import { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react';
+import PropTypes from 'prop-types';
 import {
   signInWithGoogle, signOutUser, onAuthChange,
   listenToLiveAttendance, saveQuizScore,
@@ -9,6 +10,7 @@ import {
   requestNotificationPermission
 } from './firebase.js';
 import { API } from './api.js';
+import { MAX_CHAT_MESSAGES, INPUT_DEBOUNCE_MS, ECI_HELPLINE } from './constants.js';
 
 // ─────────────────────────────────────────────────────────────────
 // CONSTANTS
@@ -66,27 +68,65 @@ const T = {
   }
 };
 
+/**
+ * Custom hook for debouncing fast-changing values
+ * @param {any} value - Value to debounce
+ * @param {number} delay - Delay in ms
+ * @returns {any} Debounced value
+ */
+function useDebounce(value, delay) {
+  const [debouncedValue, setDebouncedValue] = useState(value);
+  useEffect(() => {
+    const handler = setTimeout(() => setDebouncedValue(value), delay);
+    return () => clearTimeout(handler);
+  }, [value, delay]);
+  return debouncedValue;
+}
+
 // ─────────────────────────────────────────────────────────────────
 // MINI COMPONENTS
 // ─────────────────────────────────────────────────────────────────
-const Pill = ({ children, color = '#FF6B35', style = {} }) => (
+const Pill = React.memo(({ children, color = '#FF6B35', style = {} }) => (
   <span style={{
     display: 'inline-flex', alignItems: 'center', gap: 4,
     background: `${color}22`, color, border: `1px solid ${color}44`,
     borderRadius: 100, padding: '3px 10px', fontSize: 11, fontWeight: 700, ...style
   }}>{children}</span>
-);
+));
+Pill.propTypes = { children: PropTypes.node.isRequired, color: PropTypes.string, style: PropTypes.object };
 
-const LiveBadge = ({ count }) => (
-  <div aria-live="polite" style={{ display:'flex', alignItems:'center', gap:6, background:'rgba(26,147,111,0.12)', padding:'5px 12px', borderRadius:100, fontSize:11, fontWeight:700, color:'#1A936F' }}>
-    <span style={{ width:7, height:7, background:'#1A936F', borderRadius:'50%', display:'inline-block', animation:'pulseDot 2s infinite' }} aria-hidden="true" />
+const LiveBadge = React.memo(({ count }) => (
+  <div aria-live="polite" aria-label={`Live attendance count: ${count}`} style={{ display:'flex', alignItems:'center', gap:6, background:'rgba(26,147,111,0.12)', padding:'5px 12px', borderRadius:100, fontSize:11, fontWeight:700, color:'#1A936F' }}>
+    <span style={{ width:7, height:7, background:'#1A936F', borderRadius:'50%', display:'inline-block' }} className="pulse" aria-hidden="true" />
     {count} LIVE
   </div>
-);
+));
+LiveBadge.propTypes = { count: PropTypes.number.isRequired };
 
-const Divider = ({ color = 'rgba(255,255,255,0.06)' }) => (
-  <div style={{ height:1, background:color, margin:'20px 0' }} />
-);
+const Divider = React.memo(({ color = 'rgba(255,255,255,0.06)' }) => (
+  <div style={{ height:1, background:color, margin:'20px 0' }} aria-hidden="true" />
+));
+Divider.propTypes = { color: PropTypes.string };
+
+const LoadingSpinner = React.memo(() => (
+  <div style={{ textAlign: 'center', padding: '20px', color: '#FF6B35' }} role="status" aria-label="Loading">
+    <div style={{ fontSize: '24px' }} className="pulse" aria-hidden="true">⏳</div>
+    <p style={{ fontSize: '12px', marginTop: '8px', color: '#7a8fa0' }}>Loading...</p>
+  </div>
+));
+
+const ErrorMessage = React.memo(({ message, onRetry }) => (
+  <div role="alert" aria-live="assertive"
+       style={{ background: 'rgba(230,57,70,.1)', border: '1px solid rgba(230,57,70,.3)', borderRadius: '12px', padding: '16px', textAlign: 'center' }}>
+    <p style={{ color: '#ff8888', fontSize: '13px' }}><span aria-hidden="true">❌</span> {message}</p>
+    {onRetry && (
+      <button onClick={onRetry} aria-label="Retry action" style={{ marginTop: '8px', padding: '6px 16px', background: '#FF6B35', border: 'none', borderRadius: '12px', color: '#fff', cursor: 'pointer', fontSize: '12px' }}>
+        Retry
+      </button>
+    )}
+  </div>
+));
+ErrorMessage.propTypes = { message: PropTypes.string.isRequired, onRetry: PropTypes.func };
 
 // ─────────────────────────────────────────────────────────────────
 // MAIN APP
@@ -102,11 +142,13 @@ export default function App() {
   const [inp, setInp]       = useState('');
   const [busy, setBusy]     = useState(false);
   const chatEnd = useRef(null);
+  const mainRef = useRef(null);
 
   // Booth
   const [bState, setBState] = useState('');
   const [bDist, setBDist]   = useState('');
   const [bResult, setBRes]  = useState(null);
+  const [boothLoading, setBoothLoading] = useState(false);
 
   // Fake News
   const [fInp, setFInp]     = useState('');
@@ -116,13 +158,33 @@ export default function App() {
   // Quiz
   const [quiz, setQuiz]     = useState({ active:false, idx:0, score:0, sel:null, done:false, qs:[] });
 
-  const t = T[lang] || T.hi;
+  // Memoized values
+  const t = useMemo(() => T[lang] || T.hi, [lang]);
+
+  const tabList = useMemo(() => [
+    { id: 'home', icon: '🏠', label: t.home },
+    { id: 'chat', icon: '💬', label: t.chat },
+    { id: 'guide', icon: '📋', label: t.guide },
+    { id: 'booth', icon: '📍', label: t.booth },
+    { id: 'docs', icon: '🪪', label: t.docs },
+    { id: 'fake', icon: '🔍', label: t.fake },
+    { id: 'quiz', icon: '🎮', label: t.quiz },
+  ], [t]);
+
+  const verdictColorMap = useMemo(() => ({
+    TRUE: '#1A936F', FALSE: '#e63946',
+    'PARTLY TRUE': '#FF6B35', ILLEGAL: '#8B5CF6',
+    UNVERIFIED: '#FBBF24', ERROR: '#FBBF24'
+  }), []);
+
+  const debouncedInp = useDebounce(inp, INPUT_DEBOUNCE_MS);
+  const debouncedFakeInp = useDebounce(fInp, INPUT_DEBOUNCE_MS);
 
   // ─── EFFECTS ────────────────────────────────────────────────
   useEffect(() => onAuthChange(setUser), []);
   useEffect(() => {
     setMsgs([{ r:'bot', t: t.greeting }]);
-  }, [lang]); // eslint-disable-line
+  }, [lang, t.greeting]);
   useEffect(() => {
     const unsub = listenToLiveAttendance('demo-event-001', d => setLive(d.count));
     return unsub;
@@ -130,54 +192,126 @@ export default function App() {
   useEffect(() => { requestNotificationPermission(); }, []);
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior:'smooth' }); }, [msgs]);
 
+  /**
+   * Switches the active language and updates document properties for accessibility
+   * @param {string} newLang - The language code to switch to (e.g. 'en', 'hi')
+   * @returns {void}
+   */
+  const handleLanguageSwitch = useCallback((newLang) => {
+    trackLanguageSwitch(lang, newLang);
+    setLang(newLang);
+    document.documentElement.lang = newLang;
+    document.title = newLang === 'hi'
+      ? 'चुनाव साथी - Election Guide'
+      : 'Chunao Saathi - Election Guide';
+  }, [lang]);
+
+  /**
+   * Handles tab change and focuses the main content area for screen readers
+   * @param {string} tabId - ID of the tab to switch to
+   * @returns {void}
+   */
+  const handleTabChange = useCallback((tabId) => {
+    setTab(tabId);
+    trackEvent('feature_clicked', { feature: tabId });
+    setTimeout(() => mainRef.current?.focus(), 100);
+  }, []);
+
+  /**
+   * Safe method to add messages, keeping only the last MAX_CHAT_MESSAGES
+   * @param {Object} msg - The message object to add
+   * @returns {void}
+   */
+  const addMessage = useCallback((msg) => {
+    setMsgs(prev => {
+      const updated = [...prev, msg];
+      return updated.length > MAX_CHAT_MESSAGES ? updated.slice(-MAX_CHAT_MESSAGES) : updated;
+    });
+  }, []);
+
   // ─── CHAT ────────────────────────────────────────────────────
-  const send = useCallback(async () => {
-    if (!inp.trim() || busy) return;
-    const q = inp.trim();
-    setMsgs(p => [...p, { r:'user', t:q }]);
+  /**
+   * Sends user message to Gemini AI chatbot
+   * Adds message to chat history and handles API response
+   * @async
+   * @returns {Promise<void>}
+   */
+  const sendMessage = useCallback(async () => {
+    if (!debouncedInp.trim() || busy) return;
+    const q = debouncedInp.trim();
+    addMessage({ r:'user', t:q });
     setInp('');
     setBusy(true);
     trackChatbotQuestion(lang);
     try {
       const reply = await API.chatbot(q, lang);
-      setMsgs(p => [...p, { r:'bot', t:reply }]);
+      addMessage({ r:'bot', t:reply });
     } catch {
-      setMsgs(p => [...p, { r:'bot', t: lang === 'hi' ? '❌ त्रुटि हुई। कृपया दोबारा कोशिश करें।' : '❌ Error. Please try again.' }]);
+      addMessage({ r:'bot', t: lang === 'hi' ? '❌ त्रुटि हुई। कृपया दोबारा कोशिश करें।' : '❌ Error. Please try again.' });
     }
     setBusy(false);
-  }, [inp, busy, lang]);
+  }, [debouncedInp, busy, lang, addMessage]);
 
-  // Suggested questions
-  const suggestions = lang === 'hi'
+  const handleChatKeyDown = useCallback((e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  }, [sendMessage]);
+
+  const suggestions = useMemo(() => lang === 'hi'
     ? ['वोट कैसे डालें?', 'मेरा बूथ नंबर', 'NOTA क्या है?', 'ईवीएम कैसे काम करता है?']
-    : ['How to vote?', 'Find my booth', 'What is NOTA?', 'How does EVM work?'];
+    : ['How to vote?', 'Find my booth', 'What is NOTA?', 'How does EVM work?'], [lang]);
 
   // ─── FAKER NEWS ──────────────────────────────────────────────
+  /**
+   * Checks if a given claim is fake news using backend API
+   * @async
+   * @returns {Promise<void>}
+   */
   const checkFake = useCallback(async () => {
-    if (!fInp.trim()) return;
+    if (!debouncedFakeInp.trim()) return;
     setFLoad(true); setFRes(null);
     try {
-      const r = await API.checkFakeNews(fInp.trim());
+      const r = await API.checkFakeNews(debouncedFakeInp.trim());
       setFRes(r);
       trackFakeNewsCheck(r.verdict);
     } catch {
       setFRes({ verdict:'ERROR', explanation: lang === 'hi' ? 'सत्यापन में त्रुटि।' : 'Verification failed.' });
     }
     setFLoad(false);
-  }, [fInp, lang]);
+  }, [debouncedFakeInp, lang]);
 
   // ─── QUIZ ────────────────────────────────────────────────────
-  const startQuiz = () => {
+  /**
+   * Initializes a new quiz with shuffled questions
+   * Tracks quiz_started event to Firebase Analytics
+   * @returns {void}
+   */
+  const startQuiz = useCallback(() => {
     const qs = [...QUIZ_QUESTIONS].sort(() => Math.random() - 0.5).slice(0, 5);
     setQuiz({ active:true, idx:0, score:0, sel:null, done:false, qs });
     trackEvent('quiz_started');
-  };
-  const pick = i => {
+  }, []);
+
+  /**
+   * Records voter's answer selection for current quiz question
+   * @param {number} i - Index of selected answer option (0-3)
+   * @returns {void}
+   */
+  const selectAnswer = useCallback((i) => {
     if (quiz.sel !== null) return;
     const correct = i === quiz.qs[quiz.idx].ans;
     setQuiz(p => ({ ...p, sel:i, score: p.score + (correct ? 1 : 0) }));
-  };
-  const nextQ = async () => {
+  }, [quiz]);
+
+  /**
+   * Advances to next quiz question or marks quiz as complete
+   * Saves score to Firebase Firestore if user is authenticated
+   * @async
+   * @returns {Promise<void>}
+   */
+  const nextQuestion = useCallback(async () => {
     const next = quiz.idx + 1;
     if (next >= quiz.qs.length) {
       setQuiz(p => ({ ...p, done:true }));
@@ -185,24 +319,46 @@ export default function App() {
     } else {
       setQuiz(p => ({ ...p, idx:next, sel:null }));
     }
-  };
+  }, [quiz, user]);
+
+  /**
+   * Keyboard handler for quiz options
+   * @param {Object} e - React Synthetic Event
+   * @param {number} i - Index of option
+   * @returns {void}
+   */
+  const handleQuizKeyDown = useCallback((e, i) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      selectAnswer(i);
+    }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      const next = document.querySelector(`[data-quiz-option="${(i + 1) % 4}"]`);
+      next?.focus();
+    }
+    if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+      e.preventDefault();
+      const prev = document.querySelector(`[data-quiz-option="${(i + 3) % 4}"]`);
+      prev?.focus();
+    }
+  }, [selectAnswer]);
 
   // ─── BOOTH ───────────────────────────────────────────────────
-  const findBooth = () => {
+  /**
+   * Finds polling booth based on selected state and district
+   * Tracks search event to Firebase Analytics
+   * @returns {void}
+   */
+  const findBooth = useCallback(() => {
     if (!bState) return;
-    setBRes({ state: bState, district: bDist || 'Central District', booth:'Govt. Sr. Sec. School, Ward 4', time:'7:00 AM – 6:00 PM' });
-    trackBoothSearch(bState, bDist);
-  };
-
-  const tabs = [
-    { id:'home', icon:'🏠', label:t.home },
-    { id:'chat', icon:'💬', label:t.chat },
-    { id:'guide', icon:'📋', label:t.guide },
-    { id:'booth', icon:'📍', label:t.booth },
-    { id:'docs', icon:'🪪', label:t.docs },
-    { id:'fake', icon:'🔍', label:t.fake },
-    { id:'quiz', icon:'🎮', label:t.quiz },
-  ];
+    setBoothLoading(true);
+    setTimeout(() => {
+      setBRes({ state: bState, district: bDist || 'Central District', booth:'Govt. Sr. Sec. School, Ward 4', time:'7:00 AM – 6:00 PM' });
+      trackBoothSearch(bState, bDist);
+      setBoothLoading(false);
+    }, 600);
+  }, [bState, bDist]);
 
   // ─── STYLES ──────────────────────────────────────────────────
   const CSS = `
@@ -283,25 +439,25 @@ export default function App() {
   // ─────────────────────────────────────────────────────────────
   // SECTION RENDERERS
   // ─────────────────────────────────────────────────────────────
-  const renderHome = () => (
+  const renderHome = useCallback(() => (
     <div>
       {/* HERO */}
       <div className="fade-up" style={{ background:'linear-gradient(135deg,#FF6B35,#C23B1A)', borderRadius:28, padding:28, marginBottom:20, position:'relative', overflow:'hidden' }}>
         <div style={{ position:'absolute', top:-10, right:-10, fontSize:130, opacity:.08, lineHeight:1 }} aria-hidden="true">🗳️</div>
-        <Pill color="#fff" style={{ marginBottom:12 }}>🇮🇳 {lang === 'hi' ? 'भारत निर्वाचन आयोग' : 'Election Commission of India'}</Pill>
+        <Pill color="#fff" style={{ marginBottom:12 }}><span aria-hidden="true">🇮🇳</span> {lang === 'hi' ? 'भारत निर्वाचन आयोग' : 'Election Commission of India'}</Pill>
         <h1 style={{ fontSize:34, fontWeight:800, lineHeight:1.1, color:'#fff', margin:'12px 0 10px', letterSpacing:'-0.5px', whiteSpace:'pre-line' }}>
           {t.heroTitle}
         </h1>
         <p style={{ fontSize:14, color:'rgba(255,255,255,0.8)', lineHeight:1.6, marginBottom:20 }}>{t.heroSub}</p>
         <div style={{ display:'flex', gap:10, flexWrap:'wrap' }}>
-          <button className="btn btn-ghost" onClick={() => setTab('chat')} style={{ borderColor:'rgba(255,255,255,0.3)' }}>
+          <button className="btn btn-ghost" onClick={() => handleTabChange('chat')} style={{ borderColor:'rgba(255,255,255,0.3)' }} aria-label="Open AI Chatbot">
             {lang === 'hi' ? 'AI से पूछें →' : 'Ask AI Assistant →'}
           </button>
-          <div style={{ display:'flex', gap:6, alignItems:'center', background:'rgba(255,255,255,0.12)', borderRadius:12, padding:'4px 6px' }}>
+          <div style={{ display:'flex', gap:6, alignItems:'center', background:'rgba(255,255,255,0.12)', borderRadius:12, padding:'4px 6px' }} role="group" aria-label="Language selection">
             {['hi','en'].map(l => (
               <button key={l}
                 style={{ background: lang===l ? '#fff' : 'transparent', color: lang===l ? '#FF6B35' : '#fff', border:'none', borderRadius:8, padding:'5px 10px', fontWeight:700, fontSize:12, cursor:'pointer', transition:'all .2s' }}
-                onClick={() => { setLang(l); trackLanguageSwitch(lang, l); }} aria-pressed={lang===l}
+                onClick={() => handleLanguageSwitch(l)} aria-pressed={lang===l}
               >{l.toUpperCase()}</button>
             ))}
           </div>
@@ -316,7 +472,7 @@ export default function App() {
           { id:'fake', icon:'🛡️', label: lang==='hi' ? 'सत्यता जांचें' : 'Fact Check', sub: lang==='hi' ? 'अफवाह से बचें' : 'Stop Misinformation', color:'#8B5CF6' },
           { id:'quiz', icon:'🏆', label: lang==='hi' ? 'क्विज़ खेलें' : 'Play Quiz', sub: lang==='hi' ? 'ज्ञान बढ़ाएं' : 'Test Knowledge', color:'#1A936F' },
         ].map(f => (
-          <button key={f.id} className="card" onClick={() => setTab(f.id)} style={{ textAlign:'left', background:'rgba(255,255,255,0.02)', cursor:'pointer' }} aria-label={`Open ${f.label}`}>
+          <button key={f.id} className="card" onClick={() => handleTabChange(f.id)} style={{ textAlign:'left', background:'rgba(255,255,255,0.02)', cursor:'pointer' }} aria-label={`Open ${f.label}`}>
             <div style={{ fontSize:30, marginBottom:10 }} aria-hidden="true">{f.icon}</div>
             <div style={{ fontWeight:700, fontSize:15, color:'#fff' }}>{f.label}</div>
             <div style={{ fontSize:11, color:'#666', marginTop:3 }}>{f.sub}</div>
@@ -327,26 +483,26 @@ export default function App() {
       {/* HELPLINE */}
       <div className="fade-up-delay2 card-flat" style={{ display:'flex', alignItems:'center', justifyContent:'space-between', borderColor:'rgba(46,91,255,0.2)', background:'rgba(46,91,255,0.05)' }}>
         <div>
-          <div style={{ fontSize:11, color:'#2E5BFF', fontWeight:700, letterSpacing:1, marginBottom:4 }}>📞 {lang==='hi' ? 'मतदाता हेल्पलाइन' : 'VOTER HELPLINE'}</div>
-          <div style={{ fontSize:32, fontWeight:800, letterSpacing:4 }}>1950</div>
+          <div style={{ fontSize:11, color:'#2E5BFF', fontWeight:700, letterSpacing:1, marginBottom:4 }}><span aria-hidden="true">📞</span> {lang==='hi' ? 'मतदाता हेल्पलाइन' : 'VOTER HELPLINE'}</div>
+          <div style={{ fontSize:32, fontWeight:800, letterSpacing:4 }}>{ECI_HELPLINE}</div>
           <div style={{ fontSize:11, color:'#666', marginTop:3 }}>{lang==='hi' ? '24×7 निःशुल्क सेवा' : 'Free 24×7 service'}</div>
         </div>
-        <a href="tel:1950" className="btn btn-primary" style={{ padding:'12px 20px', textDecoration:'none', borderRadius:14 }}>
+        <a href={`tel:${ECI_HELPLINE}`} className="btn btn-primary" style={{ padding:'12px 20px', textDecoration:'none', borderRadius:14 }} aria-label="Call Voter Helpline">
           {lang==='hi' ? 'कॉल करें' : 'Call Now'}
         </a>
       </div>
     </div>
-  );
+  ), [lang, t, handleLanguageSwitch, handleTabChange]);
 
-  const renderChat = () => (
+  const renderChat = useCallback(() => (
     <div style={{ display:'flex', flexDirection:'column', height:'calc(100vh - 200px)' }} aria-label="AI Chat Interface">
       {/* Header */}
       <div className="card-flat" style={{ marginBottom:12, display:'flex', alignItems:'center', gap:12 }}>
-        <div style={{ width:44, height:44, borderRadius:14, background:'linear-gradient(135deg,#FF6B35,#D44D1F)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:22 }}>🤖</div>
+        <div style={{ width:44, height:44, borderRadius:14, background:'linear-gradient(135deg,#FF6B35,#D44D1F)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:22 }} aria-hidden="true">🤖</div>
         <div>
-          <div style={{ fontWeight:700, fontSize:15 }}>Chunao Saathi AI</div>
+          <h2 style={{ fontWeight:700, fontSize:15, margin:0 }}>Chunao Saathi AI</h2>
           <div style={{ fontSize:11, color:'#1A936F', fontWeight:600, display:'flex', alignItems:'center', gap:4 }}>
-            <span style={{ width:6, height:6, background:'#1A936F', borderRadius:'50%', display:'inline-block', animation:'pulseDot 2s infinite' }} />
+            <span style={{ width:6, height:6, background:'#1A936F', borderRadius:'50%', display:'inline-block' }} className="pulse" aria-hidden="true" />
             {lang==='hi' ? 'ऑनलाइन • Gemini AI' : 'Online • Gemini AI'}
           </div>
         </div>
@@ -354,10 +510,10 @@ export default function App() {
 
       {/* Suggestions (first load) */}
       {msgs.length <= 1 && (
-        <div style={{ display:'flex', gap:8, flexWrap:'wrap', marginBottom:12 }}>
+        <div style={{ display:'flex', gap:8, flexWrap:'wrap', marginBottom:12 }} role="group" aria-label="Suggested queries">
           {suggestions.map(s => (
             <button key={s} className="btn btn-ghost" style={{ fontSize:12, padding:'8px 14px', borderRadius:12, whiteSpace:'nowrap' }}
-              onClick={() => { setInp(s); setTimeout(send, 50); }}
+              onClick={() => { setInp(s); setTimeout(sendMessage, 50); }}
             >{s}</button>
           ))}
         </div>
@@ -372,8 +528,8 @@ export default function App() {
           </div>
         ))}
         {busy && (
-          <div className="bubble-bot" style={{ display:'inline-flex' }}>
-            <div className="typing"><div className="dot"/><div className="dot"/><div className="dot"/></div>
+          <div className="bubble-bot" style={{ display:'inline-flex' }} aria-label="AI is typing">
+            <div className="typing"><div className="dot" aria-hidden="true"/><div className="dot" aria-hidden="true"/><div className="dot" aria-hidden="true"/></div>
           </div>
         )}
         <div ref={chatEnd} />
@@ -384,18 +540,22 @@ export default function App() {
         <input className="input" style={{ background:'transparent', border:'none', borderRadius:16, paddingLeft:14 }}
           placeholder={t.chatPlaceholder} value={inp}
           onChange={e => setInp(e.target.value)}
-          onKeyDown={e => e.key === 'Enter' && !e.shiftKey && send()}
+          onKeyDown={handleChatKeyDown}
           aria-label={lang==='hi' ? 'अपना सवाल लिखें' : 'Type your question'}
+          aria-required="true"
+          aria-describedby="chat-hint"
         />
         <button className="btn btn-primary" style={{ width:48, height:48, padding:0, borderRadius:16, flexShrink:0 }}
-          onClick={send} disabled={busy} aria-label="Send message">
-          <span style={{ fontSize:18 }}>➤</span>
+          onClick={sendMessage} aria-disabled={busy || !inp.trim()} disabled={busy || !inp.trim()} 
+          aria-busy={busy} aria-label={busy ? 'Sending message, please wait' : 'Send message'}>
+          <span style={{ fontSize:18 }} aria-hidden="true">➤</span>
         </button>
       </div>
+      <p id="chat-hint" className="sr-only">Press Enter to send. Ask in Hindi or English.</p>
     </div>
-  );
+  ), [lang, msgs, suggestions, busy, inp, t.chatPlaceholder, handleChatKeyDown, sendMessage]);
 
-  const renderGuide = () => {
+  const renderGuide = useCallback(() => {
     const steps = lang === 'hi'
       ? [
           { icon:'🔍', title:'नाम जांचें', desc:'electoralsearch.eci.gov.in पर या मतदाता हेल्पलाइन App पर अपना नाम खोजें।' },
@@ -430,33 +590,36 @@ export default function App() {
         ))}
       </div>
     );
-  };
+  }, [lang]);
 
-  const renderBooth = () => (
+  const renderBooth = useCallback(() => (
     <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
       <div className="fade-up card">
-        <h3 style={{ margin:'0 0 16px', fontSize:16, fontWeight:700 }}>{lang==='hi' ? '🔍 अपना राज्य और जिला चुनें' : '🔍 Select your State & District'}</h3>
+        <h3 style={{ margin:'0 0 16px', fontSize:16, fontWeight:700 }}><span aria-hidden="true">🔍</span> {lang==='hi' ? 'अपना राज्य और जिला चुनें' : 'Select your State & District'}</h3>
         <select className="input" value={bState} onChange={e => { setBState(e.target.value); setBRes(null); }}
-          style={{ marginBottom:12 }} aria-label={t.selectState}>
+          style={{ marginBottom:12 }} aria-label={t.selectState} aria-required="true" aria-describedby="state-hint">
           <option value="">{t.selectState}</option>
           {STATES.map(s => <option key={s} value={s}>{s}</option>)}
         </select>
+        <p id="state-hint" className="sr-only">Select the state where you are registered to vote</p>
         <input className="input" type="text" placeholder={t.enterDistrict}
           value={bDist} onChange={e => { setBDist(e.target.value); setBRes(null); }}
           style={{ marginBottom:16 }} aria-label={t.enterDistrict}
         />
-        <button className="btn btn-primary" style={{ width:'100%', borderRadius:16 }} onClick={findBooth} disabled={!bState}>
-          {t.findBooth}
+        <button className="btn btn-primary" style={{ width:'100%', borderRadius:16 }} onClick={findBooth} disabled={!bState || boothLoading}>
+          {boothLoading ? 'Loading...' : t.findBooth}
         </button>
       </div>
 
-      {bResult && (
+      {boothLoading && <LoadingSpinner />}
+
+      {bResult && !boothLoading && (
         <div className="fade-up">
           <div className="card" style={{ background:'rgba(26,147,111,0.05)', borderColor:'rgba(26,147,111,0.25)', marginBottom:16 }}>
             <div style={{ display:'flex', gap:12, alignItems:'center', marginBottom:12 }}>
-              <div style={{ fontSize:32, lineHeight:1 }}>🏫</div>
+              <div style={{ fontSize:32, lineHeight:1 }} aria-hidden="true">🏫</div>
               <div>
-                <div style={{ fontSize:12, color:'#1A936F', fontWeight:700, marginBottom:2 }}>✅ {lang==='hi' ? 'मतदान केंद्र मिला' : 'BOOTH ASSIGNED'}</div>
+                <div style={{ fontSize:12, color:'#1A936F', fontWeight:700, marginBottom:2 }}><span aria-hidden="true">✅</span> {lang==='hi' ? 'मतदान केंद्र मिला' : 'BOOTH ASSIGNED'}</div>
                 <div style={{ fontWeight:700, fontSize:17 }}>{bResult.booth}</div>
               </div>
             </div>
@@ -471,7 +634,7 @@ export default function App() {
                 <div style={{ fontWeight:700, fontSize:14 }}>{bResult.district}</div>
               </div>
               <div className="card-flat" style={{ gridColumn:'1/-1' }}>
-                <div style={{ fontSize:11, color:'#666', marginBottom:3 }}>⏰ {lang==='hi' ? 'मतदान समय' : 'Polling Time'}</div>
+                <div style={{ fontSize:11, color:'#666', marginBottom:3 }}><span aria-hidden="true">⏰</span> {lang==='hi' ? 'मतदान समय' : 'Polling Time'}</div>
                 <div style={{ fontWeight:700, fontSize:14 }}>{bResult.time}</div>
               </div>
             </div>
@@ -483,19 +646,19 @@ export default function App() {
               title={`Map: ${bResult.booth}`}
               width="100%" height="100%"
               style={{ border:0, display:'block', filter:'invert(90%) hue-rotate(180deg) brightness(95%) contrast(88%)' }}
-              loading="lazy" allowFullScreen referrerPolicy="no-referrer-when-downgrade"
+              loading="lazy" fetchpriority="low" allowFullScreen referrerPolicy="no-referrer-when-downgrade"
               src={`https://www.google.com/maps/embed/v1/place?key=${import.meta.env.VITE_GOOGLE_MAPS_KEY}&q=${encodeURIComponent(bResult.booth + ', ' + bResult.district + ', ' + bResult.state)}&zoom=15`}
             />
           </div>
           <p style={{ fontSize:11, color:'#444', textAlign:'center', marginTop:8 }}>
-            ⚠️ {lang==='hi' ? 'मानचित्र न दिखे? Google Cloud में Maps Embed API चालू करें।' : 'Map not showing? Enable Maps Embed API in Google Cloud Console.'}
+            <span aria-hidden="true">⚠️</span> {lang==='hi' ? 'मानचित्र न दिखे? Google Cloud में Maps Embed API चालू करें।' : 'Map not showing? Enable Maps Embed API in Google Cloud Console.'}
           </p>
         </div>
       )}
     </div>
-  );
+  ), [lang, t, bState, bDist, bResult, boothLoading, findBooth]);
 
-  const renderDocs = () => {
+  const renderDocs = useCallback(() => {
     const docs = lang === 'hi'
       ? [
           { icon:'🪪', name:'EPIC कार्ड (मतदाता ID)', primary:true },
@@ -536,14 +699,13 @@ export default function App() {
         ))}
       </div>
     );
-  };
+  }, [lang]);
 
-  const renderFake = () => {
+  const renderFake = useCallback(() => {
     const verdictClass = {
       FALSE:'verdict-false', TRUE:'verdict-true', UNVERIFIED:'verdict-unverified', ERROR:'verdict-unverified'
     };
     const verdictIcon = { FALSE:'❌', TRUE:'✅', UNVERIFIED:'⚠️', ERROR:'⚠️' };
-    const verdictColor = { FALSE:'#ef4444', TRUE:'#1A936F', UNVERIFIED:'#FBBF24', ERROR:'#FBBF24' };
 
     return (
       <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
@@ -555,21 +717,25 @@ export default function App() {
           </div>
           <textarea className="input" style={{ height:110, resize:'none', borderRadius:16, fontSize:14 }}
             placeholder={t.fakePH} value={fInp} onChange={e => setFInp(e.target.value)}
-            aria-label={lang==='hi' ? 'खबर या अफवाह दर्ज करें' : 'Enter news claim'}
+            aria-label="Enter election claim or rumour to fact-check"
+            aria-required="true" aria-describedby="fake-hint" aria-multiline="true"
           />
+          <p id="fake-hint" style={{ fontSize: '10px', color: '#556677', marginTop: '4px' }}>
+            Paste WhatsApp message or news headline. We will verify it.
+          </p>
           <button className="btn btn-primary fade-up" style={{ width:'100%', borderRadius:16, marginTop:12 }}
-            onClick={checkFake} disabled={fLoad || !fInp.trim()}>
+            onClick={checkFake} disabled={fLoad || !fInp.trim()} aria-busy={fLoad}>
             {fLoad ? t.checking : t.verifyNews}
           </button>
         </div>
 
         {fRes && (
-          <div className={`fade-up ${verdictClass[fRes.verdict] || 'verdict-unverified'}`} role="alert">
+          <div className={`fade-up ${verdictClass[fRes.verdict] || 'verdict-unverified'}`} role="alert" aria-live="assertive">
             <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:12 }}>
               <span style={{ fontSize:24 }} aria-hidden="true">{verdictIcon[fRes.verdict] || '⚠️'}</span>
               <div>
                 <div style={{ fontSize:12, opacity:.7, marginBottom:2 }}>{lang==='hi' ? 'निर्णय' : 'VERDICT'}</div>
-                <div style={{ fontWeight:800, fontSize:20, color: verdictColor[fRes.verdict] || '#FBBF24' }}>{fRes.verdict}</div>
+                <div style={{ fontWeight:800, fontSize:20, color: verdictColorMap[fRes.verdict] || '#FBBF24' }}>{fRes.verdict}</div>
               </div>
             </div>
             <p style={{ margin:0, fontSize:14, lineHeight:1.65, color:'#ccc' }}>{fRes.explanation}</p>
@@ -595,20 +761,20 @@ export default function App() {
         ))}
       </div>
     );
-  };
+  }, [lang, t, fInp, fLoad, fRes, checkFake, verdictColorMap]);
 
-  const renderQuiz = () => {
+  const renderQuiz = useCallback(() => {
     if (!quiz.active) return (
       <div className="card fade-up" style={{ textAlign:'center', padding:40 }}>
-        <div style={{ fontSize:72, marginBottom:20, lineHeight:1 }} role="img" aria-label="Trophy">🏆</div>
+        <div style={{ fontSize:72, marginBottom:20, lineHeight:1 }} role="img" aria-hidden="true">🏆</div>
         <h2 style={{ fontSize:24, fontWeight:800, marginBottom:10 }}>{t.quizTitle}</h2>
         <p style={{ color:'#888', fontSize:14, lineHeight:1.6, marginBottom:28 }}>
           {lang==='hi'
-            ? 'भारतीय चुनाव प्रणाली के बारे में 5 सवालों का जवाब दें और अपनी जानकारी बढ़ाएं!'
-            : 'Answer 5 questions about the Indian election system and test your civic knowledge!'}
+            ? 'भारतीय चुनाव प्रणाली के बारे में सवालों का जवाब दें और अपनी जानकारी बढ़ाएं!'
+            : 'Answer questions about the Indian election system and test your civic knowledge!'}
         </p>
         <button className="btn btn-primary" style={{ width:'100%', borderRadius:18, padding:'16px' }} onClick={startQuiz}>
-          🎮 {t.startQuiz}
+          <span aria-hidden="true">🎮</span> {t.startQuiz}
         </button>
       </div>
     );
@@ -618,7 +784,7 @@ export default function App() {
       const emoji = pct >= 80 ? '🥇' : pct >= 60 ? '🥈' : '🥉';
       return (
         <div className="card fade-up" style={{ textAlign:'center', padding:36 }}>
-          <div style={{ fontSize:64, marginBottom:8 }}>{emoji}</div>
+          <div style={{ fontSize:64, marginBottom:8 }} aria-hidden="true">{emoji}</div>
           <h2 style={{ fontSize:22, fontWeight:800 }}>{t.quizScore}</h2>
           <div style={{ fontSize:52, fontWeight:800, color:'#FF6B35', margin:'12px 0' }}>
             {quiz.score}<span style={{ fontSize:22, color:'#666' }}>/{quiz.qs.length}</span>
@@ -645,20 +811,20 @@ export default function App() {
         {/* Progress */}
         <div>
           <div style={{ display:'flex', justifyContent:'space-between', fontSize:12, color:'#666', marginBottom:6 }}>
-            <span>{lang==='hi' ? `प्रश्न ${quiz.idx+1} / ${quiz.qs.length}` : `Question ${quiz.idx+1} of ${quiz.qs.length}`}</span>
-            <span style={{ color:'#1A936F', fontWeight:700 }}>⭐ {quiz.score}</span>
+            <span aria-live="polite">{lang==='hi' ? `प्रश्न ${quiz.idx+1} / ${quiz.qs.length}` : `Question ${quiz.idx+1} of ${quiz.qs.length}`}</span>
+            <span style={{ color:'#1A936F', fontWeight:700 }}><span aria-hidden="true">⭐</span> {quiz.score}</span>
           </div>
           <div className="prog-bar"><div className="prog-fill" style={{ width:`${pct}%` }} /></div>
         </div>
 
         {/* Question */}
         <div className="card" style={{ background:'rgba(255,107,53,0.04)', borderColor:'rgba(255,107,53,0.15)' }}>
-          <div style={{ fontSize:12, color:'#FF6B35', fontWeight:700, marginBottom:10 }}>Q{quiz.idx + 1}</div>
+          <h3 style={{ fontSize:12, color:'#FF6B35', fontWeight:700, marginBottom:10, margin:0 }}>Q{quiz.idx + 1}</h3>
           <p style={{ fontSize:17, fontWeight:600, lineHeight:1.5, margin:0 }}>{question}</p>
         </div>
 
         {/* Options */}
-        <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+        <div role="radiogroup" aria-label="Answer options" aria-required="true" style={{ display:'flex', flexDirection:'column', gap:10 }}>
           {q.opts.map((opt, i) => {
             let cls = 'quiz-opt';
             if (quiz.sel !== null) {
@@ -666,9 +832,14 @@ export default function App() {
               else if (i === quiz.sel) cls += ' wrong';
             }
             return (
-              <button key={i} className={cls} onClick={() => pick(i)} disabled={quiz.sel !== null}
-                aria-label={`Option ${i + 1}: ${opt}`}>
-                <span style={{ opacity:.5, marginRight:10, fontSize:12 }}>
+              <button key={i} className={cls} onClick={() => selectAnswer(i)} disabled={quiz.sel !== null}
+                onKeyDown={(e) => handleQuizKeyDown(e, i)}
+                data-quiz-option={i}
+                tabIndex={0}
+                role="radio"
+                aria-checked={quiz.sel === i}
+                aria-label={`Option ${['A','B','C','D'][i]}: ${opt}${quiz.sel !== null ? (i === q.ans ? ' - Correct answer' : quiz.sel === i ? ' - Your wrong answer' : '') : ''}`}>
+                <span style={{ opacity:.5, marginRight:10, fontSize:12 }} aria-hidden="true">
                   {String.fromCharCode(65 + i)}.
                 </span>
                 {opt}
@@ -679,7 +850,7 @@ export default function App() {
 
         {quiz.sel !== null && (
           <div className="fade-up" style={{ display:'flex', flexDirection:'column', gap:10 }}>
-            <div className="card-flat" style={{ 
+            <div className="card-flat" role="status" aria-live="polite" aria-atomic="true" style={{ 
               background: quiz.sel === q.ans ? 'rgba(26,147,111,0.1)' : 'rgba(239,68,68,0.1)',
               borderColor: quiz.sel === q.ans ? 'rgba(26,147,111,0.3)' : 'rgba(239,68,68,0.3)',
               fontSize:14, textAlign:'center', fontWeight:700,
@@ -689,16 +860,16 @@ export default function App() {
                 ? `✅ ${t.correct}!`
                 : `❌ ${t.incorrect} — ${lang === 'hi' ? 'सही उत्तर' : 'Correct'}: ${q.opts[q.ans]}`}
             </div>
-            <button className="btn btn-primary" style={{ width:'100%', borderRadius:16 }} onClick={nextQ}>
+            <button className="btn btn-primary" style={{ width:'100%', borderRadius:16 }} onClick={nextQuestion}>
               {quiz.idx + 1 < quiz.qs.length ? t.nextQ : t.seeResults} →
             </button>
           </div>
         )}
       </div>
     );
-  };
+  }, [lang, t, quiz, startQuiz, selectAnswer, nextQuestion, handleQuizKeyDown]);
 
-  const sectionMap = { home:renderHome, chat:renderChat, guide:renderGuide, booth:renderBooth, docs:renderDocs, fake:renderFake, quiz:renderQuiz };
+  const sectionMap = useMemo(() => ({ home:renderHome, chat:renderChat, guide:renderGuide, booth:renderBooth, docs:renderDocs, fake:renderFake, quiz:renderQuiz }), [renderHome, renderChat, renderGuide, renderBooth, renderDocs, renderFake, renderQuiz]);
 
   // ─── RENDER ──────────────────────────────────────────────────
   return (
@@ -709,10 +880,10 @@ export default function App() {
       <header className="glass" role="banner" style={{ position:'sticky', top:0, zIndex:50, padding:'12px 20px', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
         <div style={{ display:'flex', alignItems:'center', gap:10 }}>
           <div style={{ width:40, height:40, borderRadius:13, background:'linear-gradient(135deg,#FF6B35,#D44D1F)', display:'flex', alignItems:'center', justifyContent:'center', boxShadow:'0 6px 14px rgba(255,107,53,0.35)' }}>
-            <span style={{ fontSize:20, lineHeight:1 }} role="img" aria-label="Chunao Saathi Logo">🗳️</span>
+            <span style={{ fontSize:20, lineHeight:1 }} aria-hidden="true">🗳️</span>
           </div>
           <div>
-            <div style={{ fontWeight:800, fontSize:16, letterSpacing:'-0.3px' }}>{t.appName}</div>
+            <h1 style={{ fontWeight:800, fontSize:16, margin:0, letterSpacing:'-0.3px' }}>{t.appName}</h1>
             <div style={{ fontSize:10, color:'#555', fontWeight:600 }}>{lang==='hi' ? 'लोकतंत्र की आवाज़' : 'VOICE OF DEMOCRACY'}</div>
           </div>
         </div>
@@ -733,24 +904,26 @@ export default function App() {
       {/* PAGE TITLE BAR (except home & chat) */}
       {!['home','chat'].includes(tab) && (
         <div style={{ padding:'20px 20px 0', maxWidth:640, margin:'0 auto' }}>
-          <h1 style={{ fontSize:26, fontWeight:800, margin:0, letterSpacing:'-0.3px' }}>
-            {tabs.find(t2 => t2.id === tab)?.icon} {T[lang][`${tab}Title`] || tabs.find(t2=>t2.id===tab)?.label}
-          </h1>
+          <h2 style={{ fontSize:26, fontWeight:800, margin:0, letterSpacing:'-0.3px' }}>
+            <span aria-hidden="true">{tabList.find(t2 => t2.id === tab)?.icon}</span> {T[lang][`${tab}Title`] || tabList.find(t2=>t2.id===tab)?.label}
+          </h2>
           <div style={{ height:3, width:40, background:'#FF6B35', borderRadius:2, marginTop:8 }} aria-hidden="true" />
         </div>
       )}
 
       {/* CONTENT */}
-      <main id="main-content" role="main" style={{ maxWidth:640, margin:'0 auto', padding:'20px 16px 120px' }}>
+      <main ref={mainRef} id="main-content" role="main" tabIndex={-1} aria-label="Main application content" style={{ maxWidth:640, margin:'0 auto', padding:'20px 16px 120px' }}>
         {(sectionMap[tab] || renderHome)()}
       </main>
 
       {/* BOTTOM NAV */}
-      <nav className="nav-pill glass" role="navigation" aria-label="Main navigation" style={{ width:'calc(100% - 32px)', maxWidth:440 }}>
-        {tabs.map(tb => (
+      <nav className="nav-pill glass" role="tablist" aria-label="App sections" style={{ width:'calc(100% - 32px)', maxWidth:440 }}>
+        {tabList.map(tb => (
           <button key={tb.id} className={`nav-btn ${tab === tb.id ? 'active' : ''}`}
-            onClick={() => setTab(tb.id)}
-            aria-label={tb.label} aria-current={tab === tb.id ? 'page' : undefined}>
+            onClick={() => handleTabChange(tb.id)}
+            role="tab"
+            aria-selected={tab === tb.id}
+            aria-label={`Go to ${tb.label}`} aria-current={tab === tb.id ? 'page' : undefined}>
             <span className="icon" aria-hidden="true">{tb.icon}</span>
             <span>{tb.label}</span>
           </button>
@@ -758,7 +931,7 @@ export default function App() {
       </nav>
 
       <footer role="contentinfo" style={{ textAlign:'center', padding:'10px 20px 24px', fontSize:10, color:'#333' }}>
-        🇮🇳 Chunao Saathi • Powered by Google Cloud & Gemini AI • ECI Helpline 1950
+        🇮🇳 Chunao Saathi • Powered by Google Cloud & Gemini AI • ECI Helpline {ECI_HELPLINE}
       </footer>
     </div>
   );
