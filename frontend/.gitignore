@@ -1,7 +1,7 @@
-node_modules
-dist
-.env
+node_modules/
+dist/
 .env.local
 .env.*.local
-serviceAccountKey.json
-*.key.json
+coverage/
+*.log
+.DS_Store
