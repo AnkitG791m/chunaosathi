@@ -6,8 +6,14 @@ import dotenv from 'dotenv';
 import { createServer } from 'http';
 import admin from 'firebase-admin';
 import { Storage } from '@google-cloud/storage';
-import { validate as isUUID, v4 as uuidv4 } from 'uuid';
+import { validate as isUUID } from 'uuid';
 import crypto from 'crypto';
+import {
+  RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX, MAX_BODY_SIZE,
+  CREDIT_ATTEND_BONUS, DEFAULT_CREDIT_SCORE, DEFAULT_EVENT_CAPACITY,
+  GEMINI_MODELS, GEMINI_MAX_OUTPUT_TOKENS, GEMINI_TEMPERATURE,
+  FAKE_NEWS_DB,
+} from './constants.js';
 
 dotenv.config();
 
@@ -42,6 +48,37 @@ const logToCloud = async (severity, message, data = {}) => {
   console.log(`[${severity}] ${message}`, data);
 };
 
+// ─── IN-MEMORY CACHE ─────────────────────────────────────────────────────────
+/**
+ * Simple TTL-based in-memory cache to reduce repeated Firestore reads.
+ * Keys are cache identifiers; values are { data, expiry } objects.
+ * @type {Map<string, {data: any, expiry: number}>}
+ */
+const _cache = new Map();
+
+/**
+ * Retrieves a value from the in-memory cache.
+ * Returns null if entry is missing or expired.
+ * @param {string} key - Cache key
+ * @returns {any|null} Cached data or null
+ */
+const cacheGet = (key) => {
+  const entry = _cache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiry) { _cache.delete(key); return null; }
+  return entry.data;
+};
+
+/**
+ * Stores a value in the in-memory cache with a TTL.
+ * @param {string} key - Cache key
+ * @param {any} data - Data to cache
+ * @param {number} [ttlMs=60000] - Time-to-live in milliseconds (default 60s)
+ */
+const cacheSet = (key, data, ttlMs = 60_000) => {
+  _cache.set(key, { data, expiry: Date.now() + ttlMs });
+};
+
 // ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
 
 app.use(helmet());
@@ -58,11 +95,13 @@ app.use(helmet.contentSecurityPolicy({
 }));
 
 app.use(cors({ origin: process.env.FRONTEND_URL || '*', credentials: true }));
-app.use(express.json({ limit: '10kb' }));
+app.use(express.json({ limit: MAX_BODY_SIZE }));
 app.use(rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: { error: 'Too many requests, please try again later.' }
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: RATE_LIMIT_MAX,
+  message: { error: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
 }));
 
 // Prevent parameter pollution
@@ -176,7 +215,7 @@ app.post('/api/auth/register', async (req, res) => {
       phone: cleanPhone,
       state: sanitize(state || ''),
       district: sanitize(district || ''),
-      credit_score: 100,
+      credit_score: DEFAULT_CREDIT_SCORE,
       created_at: admin.firestore.FieldValue.serverTimestamp()
     };
     await newDoc.set(voterData);
@@ -237,9 +276,15 @@ app.get('/api/voter/:userId', async (req, res) => {
  */
 app.get('/api/events', async (req, res) => {
   try {
+    const CACHE_KEY = 'events_list';
+    const cached = cacheGet(CACHE_KEY);
+    if (cached) return res.status(200).json(cached);
+
     const snapshot = await db.collection('election_events').orderBy('event_date', 'desc').get();
     const events = snapshot.docs.map(doc => doc.data());
-    res.status(200).json({ events, total: events.length });
+    const payload = { events, total: events.length };
+    cacheSet(CACHE_KEY, payload, 120_000); // Cache for 2 minutes
+    res.status(200).json(payload);
   } catch (err) {
     await logToCloud('ERROR', 'Event list error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
@@ -264,10 +309,11 @@ app.post('/api/events', verifyToken, async (req, res) => {
       event_date,
       venue: sanitize(venue),
       state: sanitize(state || ''),
-      capacity: capacity || 500,
+      capacity: capacity || DEFAULT_EVENT_CAPACITY,
       status: 'upcoming'
     };
     await docRef.set(event);
+    cacheSet('events_list', null, 0); // Invalidate event list cache on new event
     res.status(201).json({ message: 'Event created', event });
   } catch (err) {
     await logToCloud('ERROR', 'Create event error', { error: err.message });
@@ -285,9 +331,15 @@ app.post('/api/events', verifyToken, async (req, res) => {
  */
 app.get('/api/booths/:eventId', async (req, res) => {
   try {
+    const cacheKey = `booths_${req.params.eventId}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) return res.status(200).json(cached);
+
     const snaps = await db.collection('polling_booths').where('event_id', '==', req.params.eventId).get();
     const booths = snaps.docs.map(d => d.data());
-    res.status(200).json({ booths, total: booths.length });
+    const payload = { booths, total: booths.length };
+    cacheSet(cacheKey, payload, 300_000); // Cache for 5 minutes
+    res.status(200).json(payload);
   } catch (err) {
     await logToCloud('ERROR', 'Booth fetch error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
@@ -347,7 +399,7 @@ app.post('/api/attendance/mark', async (req, res) => {
     });
 
     const vRef = db.collection('voters').doc(voterData.id);
-    await vRef.update({ credit_score: admin.firestore.FieldValue.increment(10) });
+    await vRef.update({ credit_score: admin.firestore.FieldValue.increment(CREDIT_ATTEND_BONUS) });
 
     res.status(201).json({ message: 'Attendance marked successfully' });
   } catch (err) {
@@ -499,18 +551,14 @@ app.post('/api/fakenews/check', async (req, res) => {
     const { claim } = req.body;
     if (!claim) return res.status(400).json({ error: 'claim is required' });
 
-    const FAKE_NEWS_DB = [
-      { keywords: ['evm', 'hack', 'rigged'], verdict: 'FALSE', explanation: 'EVMs are standalone machines.' },
-      { keywords: ['nota', 'useless'], verdict: 'FALSE', explanation: 'NOTA is a constitutional right.' },
-    ];
     const lower = sanitize(claim).toLowerCase();
     const match = FAKE_NEWS_DB.find(f => f.keywords.some(k => lower.includes(k)));
 
-    if (match) {
-      res.status(200).json({ verdict: match.verdict, explanation: match.explanation });
-    } else {
-      res.status(200).json({ verdict: 'UNVERIFIED', explanation: 'Could not verify claim.' });
-    }
+    const result = match
+      ? { verdict: match.verdict, explanation: match.explanation }
+      : { verdict: 'UNVERIFIED', explanation: 'Could not verify this claim against known patterns. When in doubt, check eci.gov.in or call 1950.' };
+
+    res.status(200).json(result);
   } catch (err) {
     await logToCloud('ERROR', 'Fake news error', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
@@ -539,9 +587,15 @@ Topics: voting process, voter ID, EVM, NOTA, booth location, voter rights.
 Never discuss political parties or candidates.
 Keep answers under 5 lines. Be encouraging about civic duty.`;
 
-    const models = ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash'];
+    /** @type {Array<{category: string, threshold: string}>} */
+    const safetySettings = [
+      { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+    ];
 
-    for (const model of models) {
+    for (const model of GEMINI_MODELS) {
       try {
         const response = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`,
@@ -550,14 +604,9 @@ Keep answers under 5 lines. Be encouraging about civic duty.`;
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               contents: [{ parts: [{ text: `${prompt}\n\nUser: ${message}` }] }],
-              generationConfig: { temperature: 0.7, maxOutputTokens: 300 },
-              safetySettings: [
-                { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-                { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-                { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-                { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' }
-              ]
-            })
+              generationConfig: { temperature: GEMINI_TEMPERATURE, maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS },
+              safetySettings,
+            }),
           }
         );
         const data = await response.json();

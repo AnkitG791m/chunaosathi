@@ -3,6 +3,41 @@
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080';
 
+// ─── SIMPLE IN-MEMORY RESPONSE CACHE ─────────────────────────────────────────
+/** @type {Map<string, {data: any, expiry: number}>} */
+const _apiCache = new Map();
+
+/**
+ * Gets a cached API response.
+ * @param {string} key
+ * @returns {any|null}
+ */
+const apiCacheGet = (key) => {
+  const entry = _apiCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiry) { _apiCache.delete(key); return null; }
+  return entry.data;
+};
+
+/**
+ * Stores an API response in cache.
+ * @param {string} key
+ * @param {any} data
+ * @param {number} [ttlMs=30000] - 30 seconds default
+ */
+const apiCacheSet = (key, data, ttlMs = 30_000) => {
+  _apiCache.set(key, { data, expiry: Date.now() + ttlMs });
+};
+
+/** @type {Map<string, Promise<any>>} Deduplicates concurrent identical requests */
+const _inFlight = new Map();
+
+/**
+ * Core fetch wrapper with error handling.
+ * @param {string} endpoint - API path
+ * @param {RequestInit} [options={}]
+ * @returns {Promise<any>}
+ */
 const fetchAPI = async (endpoint, options = {}) => {
   const res = await fetch(`${BASE_URL}${endpoint}`, {
     headers: { 'Content-Type': 'application/json', ...options.headers },
@@ -11,6 +46,28 @@ const fetchAPI = async (endpoint, options = {}) => {
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || 'API error');
   return data;
+};
+
+/**
+ * Fetch with in-flight deduplication — prevents duplicate GET requests.
+ * @param {string} endpoint
+ * @returns {Promise<any>}
+ */
+const fetchDeduped = (endpoint) => {
+  const cached = apiCacheGet(endpoint);
+  if (cached) return Promise.resolve(cached);
+
+  if (_inFlight.has(endpoint)) return _inFlight.get(endpoint);
+
+  const promise = fetchAPI(endpoint)
+    .then((data) => {
+      apiCacheSet(endpoint, data);
+      return data;
+    })
+    .finally(() => _inFlight.delete(endpoint));
+
+  _inFlight.set(endpoint, promise);
+  return promise;
 };
 
 // ─── OFFLINE ELECTION KNOWLEDGE BASE ─────────────────────────────────────────
@@ -99,28 +156,31 @@ const matchKB = (message, lang) => {
 
 // ─── MAIN API EXPORT ──────────────────────────────────────────────────────────
 export const API = {
-  health: () => fetchAPI('/api/health'),
+  health: () => fetchDeduped('/api/health'),
   register: (name, phone, state, district) =>
     fetchAPI('/api/auth/register', { method: 'POST', body: JSON.stringify({ name, phone, state, district }) }),
   login: (phone) =>
     fetchAPI('/api/auth/login', { method: 'POST', body: JSON.stringify({ phone }) }),
-  getEvents: () => fetchAPI('/api/events'),
-  getBooths: (eventId) => fetchAPI(`/api/booths/${eventId}`),
+  getEvents: () => fetchDeduped('/api/events'),
+  getBooths: (eventId) => fetchDeduped(`/api/booths/${eventId}`),
   markAttendance: (qrCode, eventId) =>
     fetchAPI('/api/attendance/mark', { method: 'POST', body: JSON.stringify({ qr_code: qrCode, event_id: eventId }) }),
-  getCredit: (userId) => fetchAPI(`/api/credit/${userId}`),
+  getCredit: (userId) => fetchDeduped(`/api/credit/${userId}`),
   submitQuestion: (question, eventId, category) =>
     fetchAPI('/api/ehsaas/question', { method: 'POST', body: JSON.stringify({ question, event_id: eventId, category }) }),
-  getQuestions: (eventId) => fetchAPI(`/api/ehsaas/${eventId}`),
+  getQuestions: (eventId) => fetchDeduped(`/api/ehsaas/${eventId}`),
   checkFakeNews: (claim) =>
     fetchAPI('/api/fakenews/check', { method: 'POST', body: JSON.stringify({ claim }) }),
 
   /**
    * Smart Chatbot:
-   * 1. Try Gemini AI (multiple models)
+   * 1. Try Gemini AI directly (with 8s timeout per model)
    * 2. Try backend proxy
    * 3. Match offline knowledge base
    * 4. Return helpful static fallback
+   * @param {string} message - User message
+   * @param {'hi'|'en'} [lang='hi'] - Language
+   * @returns {Promise<string>} AI or fallback response
    */
   chatbot: async (message, lang = 'hi') => {
     const GEMINI_KEY = import.meta.env.VITE_GEMINI_API_KEY;
@@ -129,28 +189,37 @@ export const API = {
       ? `आप चुनाव साथी हैं — भारतीय चुनाव शिक्षा AI। हिंदी/English में जवाब दें। विषय: मतदान, EVM, NOTA, voter ID, बूथ। राजनीतिक दलों पर कोई टिप्पणी नहीं। 4-5 पंक्तियों में जवाब।`
       : `You are Chunao Saathi — Indian election education AI. Answer in Hindi/English. Topics: voting, EVM, NOTA, voter ID, booths. No political commentary. Keep under 5 lines.`;
 
+    /** Reusable safety settings (defined once, not per-iteration) */
+    const safetySettings = [
+      { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+    ];
+
+    const MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash'];
+    const GEMINI_TIMEOUT_MS = 8_000;
+
     // ── STEP 1: Try Gemini AI directly ───────────────────────────
-    if (GEMINI_KEY && GEMINI_KEY.startsWith('AIzaSy')) {
-      const models = ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash'];
-      for (const model of models) {
+    if (GEMINI_KEY?.startsWith('AIzaSy')) {
+      for (const model of MODELS) {
         try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
           const res = await fetch(
             `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`,
             {
               method: 'POST',
+              signal: controller.signal,
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 contents: [{ parts: [{ text: `${systemPrompt}\n\nUser: ${message}` }] }],
                 generationConfig: { temperature: 0.7, maxOutputTokens: 300 },
-                safetySettings: [
-                  { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-                  { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-                  { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-                  { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' }
-                ]
-              })
+                safetySettings,
+              }),
             }
           );
+          clearTimeout(timer);
           const data = await res.json();
           if (data.error?.code === 429 || data.error?.code === 404) continue;
           if (data.error) break;
